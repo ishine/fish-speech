@@ -6,7 +6,12 @@ project: text2semantic_pretrain_medium
 
 # Model Configuration
 model:
-  model:
+  ar_model:
+    config:
+      n_layer: 24
+      n_head: 16
+      dim: 1024
+  nar_model:
     config:
       n_layer: 24
       n_head: 16

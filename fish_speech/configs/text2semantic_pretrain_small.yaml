@@ -5,6 +5,7 @@ defaults:
 project: text2semantic_pretrain_small
 max_length: 2048
 use_delay_pattern: false
+num_codebooks: 8
 
 # Lightning Trainer
 trainer:
@@ -27,9 +28,9 @@ train_dataset:
   server: localhost:50051
   tokenizer: ${tokenizer}
   max_length: ${max_length}
-  num_codebooks: ${model.model.config.num_codebooks}
+  num_codebooks: ${num_codebooks}
   use_speaker: false
-  phones_prob: 0.5
+  phones_prob: 1.0
   interactive_prob: 0.5
   use_delay_pattern: ${use_delay_pattern}
 
@@ -38,9 +39,9 @@ val_dataset:
   server: localhost:50052
   tokenizer: ${tokenizer}
   max_length: ${max_length}
-  num_codebooks: ${model.model.config.num_codebooks}
+  num_codebooks: ${num_codebooks}
   use_speaker: false
-  phones_prob: 0.5
+  phones_prob: 1.0
   interactive_prob: 0.5
   use_delay_pattern: ${use_delay_pattern}
 

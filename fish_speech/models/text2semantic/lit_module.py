@@ -1,3 +1,5 @@
+import itertools
+import random
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -23,7 +25,8 @@ class LoraConfig:
 class TextToSemantic(L.LightningModule):
     def __init__(
         self,
-        model: Transformer,
+        ar_model: Transformer,
+        nar_model: Transformer,
         optimizer: Any,
         lr_scheduler: Any,
         lora_config: Optional[LoraConfig] = None,
@@ -33,7 +36,8 @@ class TextToSemantic(L.LightningModule):
     ):
         super().__init__()
 
-        self.model = model
+        self.ar_model = ar_model
+        self.nar_model = nar_model
         self.optimizer_builder = optimizer
         self.lr_scheduler_builder = lr_scheduler
         self.lora_config = lora_config
@@ -46,19 +50,27 @@ class TextToSemantic(L.LightningModule):
 
     def setup_lora(self):
         # Replace the embedding layer with a LoRA layer
-        self.model.embeddings = lora.Embedding(
-            num_embeddings=self.model.embeddings.num_embeddings,
-            embedding_dim=self.model.embeddings.embedding_dim,
-            padding_idx=self.model.embeddings.padding_idx,
+        self.ar_model.embeddings = lora.Embedding(
+            num_embeddings=self.ar_model.embeddings.num_embeddings,
+            embedding_dim=self.ar_model.embeddings.embedding_dim,
+            padding_idx=self.ar_model.embeddings.padding_idx,
+            r=self.lora_config.r,
+            lora_alpha=self.lora_config.lora_alpha,
+        )
+
+        self.nar_model.embeddings = lora.Embedding(
+            num_embeddings=self.nar_model.embeddings.num_embeddings,
+            embedding_dim=self.nar_model.embeddings.embedding_dim,
+            padding_idx=self.nar_model.embeddings.padding_idx,
             r=self.lora_config.r,
             lora_alpha=self.lora_config.lora_alpha,
         )
 
         # Replace output layer with a LoRA layer
-        linears = [(self.model, "output")]
+        linears = [(self.ar_model, "output"), (self.nar_model, "output")]
 
         # Replace all linear layers with LoRA layers
-        for layer in self.model.layers:
+        for layer in itertools.chain(self.ar_model.layers, self.nar_model.layers):
             linears.extend([(layer.attention, "wqkv"), (layer.attention, "wo")])
             linears.extend(
                 [
@@ -80,10 +92,11 @@ class TextToSemantic(L.LightningModule):
             setattr(module, layer, updated_linear)
 
         # Mark only the LoRA layers as trainable
-        lora.mark_only_lora_as_trainable(self.model, bias="lora_only")
+        lora.mark_only_lora_as_trainable(self.ar_model, bias="lora_only")
+        lora.mark_only_lora_as_trainable(self.nar_model, bias="lora_only")
 
     def forward(self, x):
-        return self.model(x)
+        return self.ar_model(x)
 
     def on_save_checkpoint(self, checkpoint):
         if self.lora_config is None or self.save_lora_only is False:
@@ -127,6 +140,15 @@ class TextToSemantic(L.LightningModule):
             },
         }
 
+    def get_accuracy(self, logits, labels):
+        _, indices = logits.topk(5, dim=-1)
+        correct = indices.eq(labels.unsqueeze(-1))
+        correct[labels == -100] = 0
+        correct = correct.sum()
+        accuracy = correct / (labels != -100).sum()
+
+        return accuracy
+
     # Copied from https://github.com/eric-mitchell/direct-preference-optimization/blob/main/trainers.py#L90
     def get_batch_logps(
         self,
@@ -162,178 +184,166 @@ class TextToSemantic(L.LightningModule):
             return (per_token_logps * loss_mask).sum(-1)
 
     def _step(self, batch, batch_idx, stage: str):
-        # Do positive and negative samples in the same batch to speed up training
-        outputs = self.model(
-            x=batch["inputs"],
-            key_padding_mask=batch["attention_masks"],
-        )
-        labels = batch["labels"]
-        token_logits = outputs.token_logits
-        codebook_logits = outputs.codebook_logits
+        on_step = True if stage == "train" else False
 
-        if self.use_dpo:
-            # Firtst half is positive, second half is negative
-            token_logits, negative_token_logits = token_logits.chunk(2)
-            codebook_logits, negative_codebook_logits = codebook_logits.chunk(2)
-            labels, negative_labels = labels.chunk(2)
+        ############ Auto-regressive model ############
+        # Do positive and negative samples in the same batch to speed up training
+        ar_logits = self.ar_model(
+            x=batch["inputs"][:, 0],
+            key_padding_mask=batch["attention_masks"][:, 0],
+        )
+        ar_labels = batch["labels"][:, 0]
+
+        # if self.use_dpo:
+        #     # Firtst half is positive, second half is negative
+        #     token_logits, negative_token_logits = token_logits.chunk(2)
+        #     codebook_logits, negative_codebook_logits = codebook_logits.chunk(2)
+        #     labels, negative_labels = labels.chunk(2)
 
         # Generate labels
-        base_loss = F.cross_entropy(
-            token_logits.reshape(-1, token_logits.size(-1)),
-            labels[:, 0].reshape(-1),
+        ar_loss = F.cross_entropy(
+            ar_logits.reshape(-1, ar_logits.size(-1)),
+            ar_labels.reshape(-1),
             ignore_index=-100,
         )
 
-        # If we have a codebook, add the loss
-        if self.model.config.num_codebooks != 0:
-            codebook_labels = labels[:, 1 : 1 + self.model.config.num_codebooks].mT
-            semantic_loss = F.cross_entropy(
-                codebook_logits.reshape(-1, codebook_logits.size(-1)),
-                codebook_labels.reshape(-1),
-                ignore_index=-100,
-            )
-
-            loss = base_loss + semantic_loss
-        else:
-            loss = base_loss
-
         # If we use dpo
-        if self.use_dpo:
-            negative_codebook_labels = negative_labels[
-                :, 1 : 1 + self.model.config.num_codebooks
-            ].mT
+        # if self.use_dpo:
+        #     negative_codebook_labels = negative_labels[
+        #         :, 1 : 1 + self.model.config.num_codebooks
+        #     ].mT
 
-            positive_codebook_logps = self.get_batch_logps(
-                codebook_logits, codebook_labels
-            )
-            negative_codebook_logps = self.get_batch_logps(
-                negative_codebook_logits, negative_codebook_labels
-            )
+        #     positive_codebook_logps = self.get_batch_logps(
+        #         codebook_logits, codebook_labels
+        #     )
+        #     negative_codebook_logps = self.get_batch_logps(
+        #         negative_codebook_logits, negative_codebook_labels
+        #     )
 
-            # TODO: implement the reference model, avoid screwing up the gradients
-            dpo_loss = -F.logsigmoid(
-                (positive_codebook_logps - negative_codebook_logps) * self.dpo_beta
-            ).mean()
+        #     # TODO: implement the reference model, avoid screwing up the gradients
+        #     dpo_loss = -F.logsigmoid(
+        #         (positive_codebook_logps - negative_codebook_logps) * self.dpo_beta
+        #     ).mean()
 
-            chosen_rewards = self.dpo_beta * positive_codebook_logps.detach()
-            rejected_rewards = self.dpo_beta * negative_codebook_logps.detach()
-            reward_accuracy = (chosen_rewards > rejected_rewards).float().mean()
-            chosen_rewards, rejected_rewards = (
-                chosen_rewards.mean(),
-                rejected_rewards.mean(),
-            )
+        #     chosen_rewards = self.dpo_beta * positive_codebook_logps.detach()
+        #     rejected_rewards = self.dpo_beta * negative_codebook_logps.detach()
+        #     reward_accuracy = (chosen_rewards > rejected_rewards).float().mean()
+        #     chosen_rewards, rejected_rewards = (
+        #         chosen_rewards.mean(),
+        #         rejected_rewards.mean(),
+        #     )
 
-            loss = loss + dpo_loss
+        #     loss = loss + dpo_loss
 
-            self.log(
-                f"{stage}/dpo_loss",
-                dpo_loss,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                logger=True,
-            )
+        #     self.log(
+        #         f"{stage}/dpo_loss",
+        #         dpo_loss,
+        #         on_step=True,
+        #         on_epoch=False,
+        #         prog_bar=False,
+        #         logger=True,
+        #     )
 
-            self.log(
-                f"{stage}/chosen_rewards",
-                chosen_rewards,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                logger=True,
-            )
+        #     self.log(
+        #         f"{stage}/chosen_rewards",
+        #         chosen_rewards,
+        #         on_step=True,
+        #         on_epoch=False,
+        #         prog_bar=False,
+        #         logger=True,
+        #     )
 
-            self.log(
-                f"{stage}/rejected_rewards",
-                rejected_rewards,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                logger=True,
-            )
+        #     self.log(
+        #         f"{stage}/rejected_rewards",
+        #         rejected_rewards,
+        #         on_step=True,
+        #         on_epoch=False,
+        #         prog_bar=False,
+        #         logger=True,
+        #     )
 
-            self.log(
-                f"{stage}/reward_accuracy",
-                reward_accuracy,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                logger=True,
-            )
+        #     self.log(
+        #         f"{stage}/reward_accuracy",
+        #         reward_accuracy,
+        #         on_step=True,
+        #         on_epoch=False,
+        #         prog_bar=False,
+        #         logger=True,
+        #     )
 
         self.log(
-            f"{stage}/loss",
-            loss,
-            on_step=True,
-            on_epoch=False,
+            f"{stage}/ar_loss",
+            ar_loss,
+            on_step=on_step,
+            on_epoch=not on_step,
             prog_bar=True,
             logger=True,
+            sync_dist=not on_step,
         )
-
-        if self.model.config.num_codebooks != 0:
-            self.log(
-                f"{stage}/base_loss",
-                base_loss,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                logger=True,
-            )
-
-            self.log(
-                f"{stage}/semantic_loss",
-                semantic_loss,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                logger=True,
-            )
 
         # Top-5 accuracy
-        if self.model.config.num_codebooks == 0:
-            _, indices = token_logits.topk(5, dim=-1)
-            correct = indices.eq(labels[:, 0].unsqueeze(-1))
-            correct[labels[:, 0] == -100] = 0
-            correct = correct.sum()
-            accuracy = correct / (labels[:, 0] != -100).sum()
-        else:
-            _, indices = codebook_logits.topk(5, dim=-1)
-            correct = indices.eq(codebook_labels.unsqueeze(-1))
-            correct[codebook_labels == -100] = 0
-            correct = correct.sum()
-            accuracy = correct / (codebook_labels != -100).sum()
-
+        ar_accuracy = self.get_accuracy(ar_logits, ar_labels)
         self.log(
-            f"{stage}/top_5_accuracy",
-            accuracy,
-            on_step=True,
-            on_epoch=False,
+            f"{stage}/ar_top_5_accuracy",
+            ar_accuracy,
+            on_step=on_step,
+            on_epoch=not on_step,
             prog_bar=True,
             logger=True,
+            sync_dist=not on_step,
         )
 
-        if self.model.config.num_codebooks != self.model.config.num_in_codebooks:
-            _, indices = codebook_logits[
-                :, :, : self.model.config.num_in_codebooks
-            ].topk(5, dim=-1)
-            codebook_labels = codebook_labels[
-                :, :, : self.model.config.num_in_codebooks
-            ]
-            correct = indices.eq(codebook_labels.unsqueeze(-1))
-            correct[codebook_labels == -100] = 0
-            correct = correct.sum()
-            accuracy = correct / (codebook_labels != -100).sum()
+        ############ Non-auto-regressive model ############
+        bs, n_codebooks, n_tokens = batch["inputs"].size()
+        nar_inputs = batch["inputs"][:, 1:].reshape(bs * (n_codebooks - 1), n_tokens)
+        nar_attention_masks = batch["attention_masks"][:, 1:].reshape(
+            bs * (n_codebooks - 1), n_tokens
+        )
+        nar_labels = batch["labels"][:, 1:].reshape(bs * (n_codebooks - 1), n_tokens)
+        total_samples = nar_inputs.size(0)
 
-            self.log(
-                f"{stage}/top_5_accuracy_in",
-                accuracy,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=True,
-                logger=True,
-            )
+        # Random select total_samples/(n_codebooks - 1) samples, to reduce the training time
+        sample_indices = random.choices(
+            range(0, total_samples), k=total_samples // (n_codebooks - 1)
+        )
+        nar_inputs = nar_inputs[sample_indices]
+        nar_attention_masks = nar_attention_masks[sample_indices]
+        nar_labels = nar_labels[sample_indices]
 
-        return loss
+        nar_logits = self.nar_model(
+            x=nar_inputs,
+            key_padding_mask=nar_attention_masks,
+        )
+
+        nar_loss = F.cross_entropy(
+            nar_logits.reshape(-1, nar_logits.size(-1)),
+            nar_labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        self.log(
+            f"{stage}/nar_loss",
+            nar_loss,
+            on_step=on_step,
+            on_epoch=not on_step,
+            prog_bar=True,
+            logger=True,
+            sync_dist=not on_step,
+        )
+
+        # Top-5 accuracy
+        nar_accuracy = self.get_accuracy(nar_logits, nar_labels)
+        self.log(
+            f"{stage}/nar_top_5_accuracy",
+            nar_accuracy,
+            on_step=on_step,
+            on_epoch=not on_step,
+            prog_bar=True,
+            logger=True,
+            sync_dist=not on_step,
+        )
+
+        return ar_loss + nar_loss
 
     def training_step(self, batch, batch_idx):
         return self._step(batch, batch_idx, "train")

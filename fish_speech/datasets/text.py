@@ -531,7 +531,7 @@ class AutoAugTextDataset(IterableDataset):
             tokens[idx, 1:] = tokens[0, 1:]
 
         # Mask out semantic, <c:0>, <c:1>, <c:2>, <c:3> for mlm
-        labels[1:, : (prompt_length + bos_bias)] = -100
+        labels[:, : (prompt_length + bos_bias)] = -100
 
         tokens = tokens[:, :-1]
         labels = torch.cat([labels[:1, 1:], labels[1:, :-1]], dim=0)
@@ -579,6 +579,8 @@ class TextDataCollator:
             _attention_mask = torch.ones((self.max_length,), dtype=torch.bool)
             tokens_length = _tokens.size(1)
             _attention_mask[:tokens_length] = False
+            # Repeat _attention_mask for each codebook
+            _attention_mask = _attention_mask.unsqueeze(0).repeat(_tokens.size(0), 1)
 
             assert tokens_length == _labels.size(
                 1
